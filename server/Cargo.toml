@@ -8,3 +8,6 @@ tasko-shared = { path = "../shared" }
 actix-web = "4.3.1"
 serde = { version = "1.0", features = ["derive"] }
 uuid = "1.3.0"
+actix-web-actors = "4.2.0"
+actix = "0.13.0"
+env_logger = "0.10.0"

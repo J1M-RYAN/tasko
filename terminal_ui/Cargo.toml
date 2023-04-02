@@ -9,3 +9,9 @@ tui = "0.19.0"
 tokio = { version = "1.27.0", features = ["full"] }
 reqwest = {version = "0.11.6", features = ["json"]}
 crossterm = "0.26.1"
+tokio-tungstenite = "0.18.0"
+tokio-rustls = "0.24.0"
+futures-util = "0.3.28"
+serde_json = "1.0.95"
+url = "2.3.1"
+futures = "0.3.28"

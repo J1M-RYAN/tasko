@@ -1,12 +1,92 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
-use tasko_shared::Task;
-use tasko_shared::TaskState;
-use tasko_shared::UpdateTaskStateRequest;
-use tasko_shared::CreateTaskRequest;
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, HttpRequest, Responder, middleware::Logger};
+use actix_web_actors::ws;
+use tasko_shared::{CreateTaskRequest, Task, TaskState, UpdateTaskStateRequest};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+use actix::Actor;
+use actix::StreamHandler;
+use actix::Addr;
+use actix::Handler;
+use actix_web_actors::ws::{Message, ProtocolError};
+use actix_web_actors::ws::WebsocketContext;
+use std::collections::HashMap;
+
+use actix::Message as ActixMessage;
+
+pub struct TaskMessage(pub Task);
+
+impl ActixMessage for TaskMessage {
+    type Result = ();
+}
+
+#[derive(Clone)]
+struct WebSocket {
+    task_list: TaskList,
+    clients: Arc<RwLock<HashMap<Uuid, Addr<WebSocket>>>>,
+}
+
+
+impl WebSocket {
+    fn new(task_list: TaskList, clients: Arc<RwLock<HashMap<Uuid, Addr<WebSocket>>>>) -> Self {
+        WebSocket {
+            task_list,
+            clients,
+        }
+    }
+}
+
+impl Actor for WebSocket {
+    type Context = ws::WebsocketContext<Self>;
+}
+
+impl Handler<TaskMessage> for WebSocket {
+    type Result = ();
+
+    fn handle(&mut self, task_message: TaskMessage, ctx: &mut Self::Context) -> Self::Result {
+        let task = task_message.0;
+        for client in self.clients.read().unwrap().values() {
+            client.do_send(TaskMessage(task.clone()));
+        }
+    }
+}
+
+
+impl StreamHandler<Result<Message, ProtocolError>> for WebSocket {
+    fn handle(&mut self, msg: Result<Message, ProtocolError>, ctx: &mut WebsocketContext<Self>) {
+        match msg {
+            Ok(Message::Ping(msg)) => ctx.pong(&msg),
+            Ok(Message::Pong(_)) => (),
+            _ => (),
+        }
+    }
+}
+
+
+async fn start_websocket(
+    req: HttpRequest,
+    stream: web::Payload,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let tasks = app_state.tasks.clone();
+    let clients = app_state.clients.read().unwrap().clone();
+
+    let client_id = Uuid::new_v4();
+    let websocket_actor = WebSocket::new(tasks, clients.read().unwrap().clone());
+
+    clients.write().unwrap().insert(client_id, websocket_actor.clone().start());
+
+    ws::start(websocket_actor, &req, stream)
+}
+
 
 type TaskList = Arc<RwLock<Vec<Task>>>;
+
+struct AppState {
+    tasks: TaskList,
+    clients: RwLock<HashMap<Uuid, Addr<WebSocket>>>,
+}
+
+
 
 fn init_tasks() -> TaskList {
     let tasks = vec![
@@ -33,19 +113,25 @@ fn init_tasks() -> TaskList {
     Arc::new(RwLock::new(tasks))
 }
 
+fn init_clients() -> RwLock<HashMap<Uuid, Addr<WebSocket>>> {
+    RwLock::new(HashMap::new())
+}
+
 
 #[get("/tasks")]
-async fn get_tasks(task_list: web::Data<TaskList>) -> impl Responder {
-    let tasks = task_list.read().unwrap();
+async fn get_tasks(app_state: web::Data<AppState>) -> impl Responder {
+    let tasks = app_state.tasks.read().unwrap();
     HttpResponse::Ok().json(tasks.clone())
 }
 
 #[post("/tasks")]
 async fn create_task(
-    task_list: web::Data<TaskList>,
+    data: web::Data<AppState>,
     new_task_request: web::Json<CreateTaskRequest>,
 ) -> impl Responder {
-    let mut tasks = task_list.write().unwrap();
+    let tasks = data.tasks.clone();
+    let clients = data.clients.read().unwrap().clone();
+    let mut tasks = tasks.write().unwrap();
 
     let new_task = Task {
         id: Uuid::new_v4(),
@@ -56,8 +142,15 @@ async fn create_task(
 
     tasks.push(new_task.clone());
 
+    let clients = clients.read().unwrap();
+    for client in clients.values() {
+        client.do_send(TaskMessage(new_task.clone()));
+    }
+
     HttpResponse::Created().json(new_task)
 }
+
+
 
 
 #[post("/tasks/{id}/state")]
@@ -80,14 +173,23 @@ async fn update_task_state(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    std::env::set_var("RUST_LOG", "debug");
+    env_logger::init();
+
     let tasks = init_tasks();
+    let clients = init_clients(); 
 
     HttpServer::new(move || {
     App::new()
+        .wrap(Logger::default())
         .service(get_tasks)
         .service(update_task_state)
         .service(create_task)
-        .app_data(web::Data::new(tasks.clone()))
+        .service(web::resource("/ws/").route(web::get().to(start_websocket)))
+        .app_data(web::Data::new(AppState {
+            tasks: tasks.clone(),
+            clients: clients.read().unwrap().clone(),
+        }))
     })
     .bind("127.0.0.1:3000")?
     .run()

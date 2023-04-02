@@ -12,10 +12,48 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+// use tokio::net::TcpStream;
+use std::sync::mpsc;
+use serde_json;
+use url;
+use futures_util::stream::StreamExt;
+use futures::SinkExt;
+use futures::stream::SplitSink;
+
+
+
+
 
 enum AppState {
     ViewingTasks,
-    CreatingTask { title: String, description: String },
+    CreatingTask { mode: EditMode, title: String, description: String },
+}
+
+enum EditMode {
+    Title,
+    Description,
+}
+type WSStream = SplitSink<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+
+async fn connect_to_websocket(
+    tx: mpsc::Sender<Task>,
+) -> Result<WSStream, Box<dyn std::error::Error>> {
+    let url = url::Url::parse("ws://localhost:3000/ws/")?;
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+    let (ws_tx, mut ws_rx) = ws_stream.split();
+
+    // Spawn a task to listen for messages from the server
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            if let Ok(task) = serde_json::from_str::<Task>(&msg.to_string()) {
+                let _ = tx.send(task);
+            }
+        }
+    });
+
+    Ok::<WSStream, Box<dyn std::error::Error>>(ws_tx)
 }
 
 async fn create_task(title: &str, description: &str) -> Result<Task, reqwest::Error> {
@@ -94,6 +132,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.clear()?;
     let mut app_state = AppState::ViewingTasks;
 
+    // Create a channel for receiving new tasks from the WebSocket
+    let (tx, rx) = mpsc::channel::<Task>();
+
+     let ws_stream = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(connect_to_websocket(tx))?;
+
     loop {
         terminal.draw(|f| {
             let area = f.size();
@@ -101,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppState::ViewingTasks => {
                     render_widgets(f, area, &tasks);
                 }
-                AppState::CreatingTask { title, description } => {
+                AppState::CreatingTask { mode, title, description } => {
                     let task_input = format!("Title: {}\nDescription: {}", title, description);
                     let paragraph = Paragraph::new(task_input)
                         .block(Block::default().borders(Borders::ALL).title("Create Task"))
@@ -112,57 +157,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-        if let Event::Key(key_event) = event::read()? {
-            match app_state {
-                AppState::ViewingTasks => {
-                    if key_event.code == KeyCode::Char('q') {
-                        break;
-                    } else if key_event.code == KeyCode::Char('n') {
-                        app_state = AppState::CreatingTask {
-                            title: String::new(),
-                            description: String::new(),
-                        };
-                    }
-                }
-                AppState::CreatingTask { .. } => {
-                    if key_event.code == KeyCode::Enter {
-                        if let AppState::CreatingTask { title, description } = app_state {
-                            let task = tokio::runtime::Runtime::new()
-                                .unwrap()
-                                .block_on(create_task(&title, &description))?;
-                            tasks.push(task);
-                        }
-                        app_state = AppState::ViewingTasks;
-                    } else if key_event.code == KeyCode::Esc {
-                        app_state = AppState::ViewingTasks;
-                    } else {
-                        let title = if let AppState::CreatingTask { title, .. } = &mut app_state {
-                            title
-                        } else {
-                            unreachable!()
-                        };
+         // Check for new tasks from the WebSocket
+        if let Ok(new_task) = rx.try_recv() {
+            tasks.push(new_task);
+        }
 
-                        match key_event {
-                            KeyEvent {
-                                code: KeyCode::Char(c),
-                                ..
-                            } => {
-                                if !title.is_empty() || c != ' ' {
-                                    title.push(c);
-                                }
-                            }
-                            KeyEvent {
-                                code: KeyCode::Backspace,
-                                ..
-                            } => {
-                                title.pop();
-                            }
-                            _ => {}
+if let Event::Key(key_event) = event::read()? {
+    match &mut app_state {
+        AppState::ViewingTasks => {
+            if key_event.code == KeyCode::Char('q') {
+                break;
+            } else if key_event.code == KeyCode::Char('n') {
+                app_state = AppState::CreatingTask {
+                    mode: EditMode::Title,
+                    title: String::new(),
+                    description: String::new(),
+                };
+            }
+        }
+        AppState::CreatingTask { mode, title, description } => {
+            if key_event.code == KeyCode::Enter {
+                let new_task = tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(create_task(&title, &description))?;
+                tasks.push(new_task);
+                app_state = AppState::ViewingTasks;
+            } else if key_event.code == KeyCode::Esc {
+                app_state = AppState::ViewingTasks;
+            } else if key_event.code == KeyCode::Tab {
+                *mode = match mode {
+                    EditMode::Title => EditMode::Description,
+                    EditMode::Description => EditMode::Title,
+                };
+            } else {
+                match (mode, key_event) {
+                    (EditMode::Title, KeyEvent { code: KeyCode::Char(c), .. }) => {
+                        if !title.is_empty() || c != ' ' {
+                            title.push(c);
                         }
                     }
+                    (EditMode::Title, KeyEvent { code: KeyCode::Backspace, .. }) => {
+                        title.pop();
+                    }
+                    (EditMode::Description, KeyEvent { code: KeyCode::Char(c), .. }) => {
+                        if !description.is_empty() || c != ' ' {
+                            description.push(c);
+                        }
+                    }
+                    (EditMode::Description, KeyEvent { code: KeyCode::Backspace, .. }) => {
+                        description.pop();
+                    }
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+
+
     }
 
     disable_raw_mode()?;
