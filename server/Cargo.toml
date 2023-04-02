@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 tasko-shared = { path = "../shared" }
 actix-web = "4.3.1"
+serde = { version = "1.0", features = ["derive"] }
+uuid = "1.3.0"
