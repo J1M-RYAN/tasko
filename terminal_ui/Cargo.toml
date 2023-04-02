@@ -8,3 +8,4 @@ tasko-shared = { path = "../shared" }
 tui = "0.19.0"
 tokio = { version = "1.27.0", features = ["full"] }
 reqwest = {version = "0.11.6", features = ["json"]}
+crossterm = "0.26.1"
